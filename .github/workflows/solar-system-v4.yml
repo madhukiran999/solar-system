@@ -1,0 +1,54 @@
+name: Deploy to AWS Lambda
+
+on:
+  workflow_dispatch:
+  push:
+    branches: 
+        - feature/practice
+  pull_request:
+    branches: 
+        - feature/practice
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  LAMBDA_FUNCTION_NAME: ${{ secrets.LAMBDA_FUNCTION_NAME }}
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+        
+    - name: Install dependencies
+      run: |
+        npm ci
+        # Remove dev dependencies to keep package size smaller
+        npm prune --production
+        
+    - name: Zip Function Code
+      run: |
+        # Include node_modules in the deployment package
+        zip -r function.zip . -x "*.git*" "tests/*" "*.md"
+
+    - name: Configure AWS credentials
+      run: |
+          aws configure set aws_access_key_id ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws configure set aws_secret_access_key ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws configure set region ${{ env.AWS_REGION }}
+      
+    - name: Deploy to Lambda
+      run: |
+        aws lambda update-function-code \
+          --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+          --zip-file fileb://function.zip
