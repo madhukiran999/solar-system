@@ -1,0 +1,45 @@
+name: "NPM Custom Action"
+description: "Installing and Caching NPM Packages"
+
+inputs:
+  path-of-folder:
+    description: "The path where node_modules should be cached"
+    required: true
+  lock-file:
+    description: "Lockfile to use for cache key"
+    required: false
+    default: "package-lock.json"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Cache NPM dependencies
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.path-of-folder }}/node_modules
+        key: ${{ runner.os }}-node-modules-${{ hashFiles(format('{0}/{1}', inputs.path-of-folder, inputs.lock-file)) }}
+
+    - name: Install Dependencies
+      run: npm ci
+      working-directory: ${{ inputs.path-of-folder }}
+      shell: bash
+
+
+# name: "NPM Custom Action"
+# description: 'Installing and Caching Npm Packages'
+# inputs:
+#   path-of-folder: #id of input
+#     description: 'The Path to Cache'
+#     required: true
+
+# runs:
+#   using: "composite"
+#   steps: 
+#       - name: Cache NPM dependencies
+#         uses: actions/cache@v4
+#         with:
+#           path: ${{ inputs.path-of-folder }}
+#           key: ${{runner.os}}-node-modules-${{hashFiles('package-lock.json')}}
+
+#       - name: Install Dependencoes
+#         run: npm install

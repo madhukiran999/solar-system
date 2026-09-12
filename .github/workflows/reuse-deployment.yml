@@ -1,0 +1,131 @@
+name: Deployment - Reusable Workflow
+
+on:
+    workflow_call: 
+        inputs:
+          mongodb-uri:
+            type: string
+            required: true
+          kubectl-version:
+            description: Provide the required kubectl version
+            default: v1.27.0
+            required: false
+            type: string
+          environment:
+            description: Provide the Deployment Environment
+            default: dev
+            required: true
+            type: string
+          k8s-manifest-dir:
+            description: Directory containing kubernetes manifests files
+            default: kubernetes/
+            required: true
+            type: string
+        secrets:
+          k8s-kubeconfig:
+            required: true
+          mongodb-password:
+            required: true
+        outputs:
+          application-url:
+            value: ${{ jobs.reuses-deploy.outputs.APP_INGRESS_HOST }}
+jobs:
+    reuses-deploy:
+        environment: 
+          name: ${{inputs.environment}}
+        runs-on: ubuntu-latest
+        outputs:
+          APP_INGRESS_HOST: ${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL }}
+        steps:
+          - name: checkout Repo
+            uses: actions/checkout@v5
+
+          - name: Install kind CLI
+            run: |
+              curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+              chmod +x ./kind
+              sudo mv ./kind /usr/local/bin/kind
+              
+        # - name:  Create cluster using KinD
+        #   uses:  kubernetes-sigs/kind@v0.20.0
+        #   with:
+        #     version: v0.20.0
+        
+
+          - name: Install kubectl CLI
+            uses: azure/setup-kubectl@v4
+            with:
+                version: ${{inputs.kubectl-version}}
+
+          - name: Create KinD cluster
+            run: kind create cluster --name test-cluster
+
+          - name: Set kubeconfig
+            run: export KUBECONFIG="$(kind get kubeconfig-path --name="test-cluster")"
+        
+        # - name: Set Kubeconfig file
+        #   uses: azure/k8s-set-context@v4
+        #   with:
+        #     method: kubeconfig
+        #     kubeconfig: ${{secrets.k8s-kubeconfig}}
+        
+          - name: Fetch Kubernetes CLuster Details
+            run: |
+              echo "Client Version:"
+              kubectl version --client
+              echo "Server Version:"
+              kubectl version
+              echo "Nodes"
+              kubectl get nodes
+
+          - name: Install ingress-nginx
+            run: |
+              kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.8.1/deploy/static/provider/kind/deploy.yaml
+
+              echo "Waiting for ingress-nginx controller pod to be created..."
+              until kubectl get pods -n ingress-nginx -l app.kubernetes.io/component=controller --no-headers 2>/dev/null | grep -q .; do 
+                sleep 5
+              done
+
+              kubectl wait --namespace ingress-nginx \
+                --for=condition=ready pod \
+                --selector=app.kubernetes.io/component=controller \
+                --timeout=120s
+            
+              kubectl get pods -n ingress-nginx
+
+          - name: Set Ingress IP
+            id: ingress
+            run: |
+              NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+              NODE_PORT=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+                -o jsonpath='{.spec.ports[0].nodePort}')
+              echo "INGRESS_IP=http://$NODE_IP:$NODE_PORT" >> $GITHUB_ENV
+
+          - name: Replace Token in Manifest files
+            uses:  cschleiden/replace-tokens@v1
+            with:
+              tokenPrefix: '_{_'
+              tokenSuffix: '_}_'
+              files: '["${{inputs.k8s-manifest-dir}}*.yaml"]'
+            env:
+              NAMESPACE: ${{ vars.NAMESPACE }}
+              REPLICAS: ${{ vars.REPLICAS }}
+              IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-systems:${{ github.sha }}
+              INGRESS_IP: ${{ env.INGRESS_IP }}
+
+          - name: create MongoDB secret
+            run: |
+              kubectl -n ${{vars.NAMESPACE}} create secret generic mogo-db-creds \
+                --from-literal=MONGO_URI=${{inputs.mongodb-uri}} \
+                --from-literal=MONGO_USERNAME=${{env.MONGO_USERNAME}} \
+                --from-literal=MONGO_PASSWORD=${{secrets.mongodb-password}}
+        
+          - name: Set App Ingress Host Url
+            id: set-ingress-host-address
+            run: echo "APP_INGRESS_URL=$(kubectl get ingress -n ${{vars.NAME}} -o jsonpath="{.items[0].spec.tls[0].hosts[0]}"")" >> "$GITHUB_OUTPUT"
+
+          - name: Depoy to Dev Env
+            run: |
+              kubectl apply -f ${{ inputs.k8s-manifest-dir }}
+            

@@ -1,33 +1,255 @@
-name: Solar System Workflow
-
+name: Solar Systems Workflow
 on: 
   workflow_dispatch:
   push:
     branches:
       - main
       - 'feature/*'
-    
-jobs:
-    unit-testing:
-        name: Unit Testing
-        runs-on: ubuntu-latest
-        steps:
-        - name: Checkout Repository
-          uses: actions/checkout@v4
+env:
+  MONGO_USERNAME: ${{vars.MONGO_USERNAME}}
+  MONGO_PASSWORD: ${{secrets.MONGO_PASSWORD}}
 
-        - name: Setup NodeJS Version
-          uses: actions/setup-node@v3
-          with:
-            node-version: 20
-    
-        - name: Install Dependencies
-          run: npm install
-    
-        - name: Unit Testing
-          run: npm test
+jobs:
+  unit-testing:
+    services:
+      mongo-db:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        env:
+          MONGO_INITDB_ROOT_USERNAME: non-prod-user
+          MONGO_INITDB_ROOT_PASSWORD: non-prod-password
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'" 
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      MONGO_USERNAME: non-prod-user
+      MONGO_PASSWORD: non-prod-password
+      #MONGO_URI: mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@localhost:27017/solar_system?authSource=admin
+    strategy:
+      matrix:
+        nodejs_version: [18, 20]
+        operating_system: [ubuntu-latest]
+        exclude:
+          - nodejs_version: 18
+            operating_system: macos-latest
+
+    name: Unit Testing
+    runs-on: ${{matrix.operating_system}}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+      
+      - name: Set dynamic MONGO_URI
+        run: echo "MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@localhost:27017/solar_system?authSource=admin" >> $GITHUB_ENV
+      
+      - name: Setup NodeJS Version - ${{matrix.nodejs_version}}
+        uses: actions/setup-node@v5
+        with: 
+          node-version: ${{matrix.nodejs_version}}
+
+      - name: Cache NPM dependencies
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{runner.os}}-node-modules-${{hashFiles('package-lock.json')}}
+
+  
+      - name: Install all Dependencies
+        run: npm install
+
+      - name: Seed database
+        run: npm run seed
+      
+      - name: Unit Testing
+        id: nodejs-unit-testing-step
+        run: npm test 
+      - name: Archive Test Result
+        if : always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mocha-Test-Result-${{ github.job }}-${{ matrix.nodejs_version }}-${{ matrix.operating_system }}-${{ github.run_number }}
+          path: test-results.xml
+  
+  code-coverage:
+
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    container:
+      image: node:18
+    services:
+       mongo-db:
+        image: mongo:6.0
+        ports:
+          - 27017:27017
+        env:
+          MONGO_INITDB_ROOT_USERNAME: non-prod-user
+          MONGO_INITDB_ROOT_PASSWORD: non-prod-password
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'" 
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+    steps:
+      - name: checkout Repository
+        uses: actions/checkout@v5
+      
+      # - name: Setup NodeJs Version - 18
+      #   uses: actions/setup-node@v5
+      #   with:
+      #     node-version: 18
+
+      # - name: Cache NPM dependencies
+      #   uses: actions/cache@v4
+      #   with:
+      #     path: node_modules
+      #     key: ${{runner.os}}-node-modules-${{hashFiles('package-lock.json')}}
+
+      # - name: Install Dependencies
+      #   run: npm install 
+
+      - name: Composite Action - Cache & Install NPM Packages
+        uses: ./.github/custom-actions/npm-action/action.yml
+        with:
+          path-of-folder: node_modules
           
-        - name: Archive Test Result
-          uses: actions/upload-artifact@v3
-          with:
-            name: Mocha-Test-Result
-            path: test-results.xml
+      - name: Set dynamic MONGO_URI
+        run: echo "MONGO_URI=mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@localhost:27017/solar_system?authSource=admin" >> $GITHUB_ENV
+
+   
+
+      - name: Check Code Coverage
+        continue-on-error: true
+        run: npm run coverage
+
+      - name: Archive Test Result
+        uses: actions/upload-artifact@v4
+        with:
+          name: Code-Coverage-Result
+          path: coverage
+          retention-days: 5
+  
+  docker:
+    name: containerization
+    runs-on: ubuntu-latest
+    needs: [unit-testing, code-coverage]
+    permissions: 
+      packages: write
+    steps:
+      - name: Code Checkout
+        uses: actions/checkout@v5
+      
+      - name: Dockerhub Login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: GHCR Login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{github.repository_owner}}
+          password: ${{secrets.GITHUB_TOKEN}}
+
+      - name: Docker build for testing
+        uses: docker/build-push-action@v6
+        with:
+          push: false
+          context: .
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{github.sha}}
+      # - name: Docker Image Test
+      #   run: |
+      #     docker images
+      #     docker run --name solar-system-app -d \
+      #     -p 3000:3000 \
+      #     -e MONGO_URI=$MONGO_URI \
+      #     -e MONGO_USERNAME=$MONGO_USERNAME \
+      #     -e MONGO_PASSWORD=$MONGO_PASSWORD \
+      #     ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+  
+      #     # export IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' solar-system-app)
+      #     # echo "Adresse IP du conteneur : $IP"
+      #     echo Test URL using wget
+      #     wget -q -O - 127.0.0.1:3000/live | grep live
+    
+      - name: Normalize repo owner
+        id: vars
+        run: echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_OUTPUT
+      
+      - name: Container Registry Push for Git Hub
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{vars.DOCKERHUB_USERNAME}}/solar-system:${{github.sha}}
+            ghcr.io/${{steps.vars.outputs.owner}}/solar-system:${{ github.sha }}
+  
+  dev-deploy:
+    needs: docker
+    if: contains(github.ref, 'feature/')
+    uses:  ./.github/workflows/deploy.yml
+    secrets:
+      k8s-kubeconfig: ${{secrets.KUBECONFIG}}
+      mongodb-password: ${{secrets.MONGO_PASSWORD}}
+    with:
+      mongodb-uri: ${{vars.MONGO_URI}}
+      environement: development
+      k8s-manifest-dir: kubernetes/developement
+
+  integration-test:
+    name: Dev Integration Testing
+    needs: dev-deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test URL Ouput using CURL and JQ
+        env:
+          URL: ${{needs.dev-deploy.outputs.application-url}}
+        run: |
+          echo $URL
+          echo "-------------------------------"
+          curl https://$URL/live -s -k | jq -r .status | gre -i live
+
+  prof-deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: docker
+    uses: ./.github/workflows/deploy.yml
+    secrets:
+      k8s-kubeconfig: ${{secrets.KUBECONFIG}}
+      mongodb-password: ${{secrets.MONGO_PASSWORD}}
+    with:
+      mongodb-uri: ${{vars.MONGO_URI}}
+      environement: development
+      k8s-manifest-dir: kubernetes/production
+
+  reports-s3:
+    needs: [code-coverage, unit-testing]
+    name: AWS S3 - Upload Reports
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Download Mocha Artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Mocha-Test-Result
+      - name: Download Mocha Artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: Code-Coverage-Result
+      - name: Merge Test files
+        run: |
+          ls -ltr
+          mkdir reports_${{github.sha}}
+          mv cobertura-coverage.xml reports_${{github.sha}}
+          mv test-rsults.xml reports_${{github.sha}}
+          ls -ltr reports-${{github.sha}}
+      - name: Upload to aws S3
+        run: echo ....
+
+
+
+
