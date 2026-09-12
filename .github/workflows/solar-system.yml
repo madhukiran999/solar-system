@@ -1,5 +1,7 @@
 name: Solar System Workflow
 
+# difference between continue-on-error and if failure() is that continue-on-error will providfe a pass on the job summary
+
 on: 
   workflow_dispatch:
   push:
@@ -7,27 +9,386 @@ on:
       - main
       - 'feature/*'
     
+env:
+  MONGO_URI: 'mongodb+srv://supercluster.d83jj.mongodb.net/superData'
+  MONGO_USERNAME: ${{ vars.MONGO_USERNAME }}
+  MONGO_PASSWORD: ${{ secrets.MONGO_PASSWORD }}
+
 jobs:
     unit-testing:
         name: Unit Testing
-        runs-on: ubuntu-latest
+
+
+        # It is a private docker container. You can access environment variables. E.g in app.js process.env.variablename
+
+        # services:
+        #   mongo-db:
+        #     image: siddharth67/mongo-db:non-prod
+        #     ports:
+        #       - 27017:27017
+        # env:
+        #   MONGO_URI: 'mongodb://localhost:27017/superData'
+        #   MONGO_USERNAME: non-prod-user
+        #   MONGO_PASSWORD: non-prod-password
+
+        strategy:
+          matrix:
+            nodejs_version: [18, 20]
+            operating_system: [ubuntu-latest]
+            exclude:
+              - nodejs_version: 18
+                operating_system: macos-latest
+
+        runs-on: ${{ matrix.operating_system }}
         steps:
+
         - name: Checkout Repository
           uses: actions/checkout@v4
 
-        - name: Setup NodeJS Version
+        - name: Setup NodeJS Version - ${{ matrix.nodejs_version }}
           uses: actions/setup-node@v3
           with:
-            node-version: 20
+            node-version: ${{ matrix.nodejs_version }}
+
+            # Caching the package-lock.json so that for subsequence workflows, we do not need to reinstall the packages. npm install will run faster
+        - name: Cache NPM dependencies
+          uses: actions/cache@v4
+          with:
+            path: node_modules
+            key: ${{ runner.os }}-node-modules-${{ hashFiles('package-lock.json') }}
+
     
         - name: Install Dependencies
           run: npm install
     
         - name: Unit Testing
+          id: nodejs-unit-testing-step
           run: npm test
-          
-        - name: Archive Test Result
-          uses: actions/upload-artifact@v3
+
+# can access the artifact on github actions summary page
+        # - name: Archive Test Result
+
+          # if success()  - by default all steps status check is success() unless stated
+          # if failure() - will run if previous step fails
+          # if always() - will always run regardless if previous step fails/pass
+
+          # if always()
+          # uses: actions/upload-artifact@v4
+          # with:
+          #   name: Mocha-Test-Result
+          #   path: test-results.xml
+
+    code-coverage:
+      name: Code Coverage
+      container:
+        image: node:18
+
+
+      services:
+        mongo-db:
+          image: siddharth67/mongo-db:non-prod
+          # ports:    -- Job and service container uses the same user-define bridge network. Exposes all ports to each other, don't need to map ports
+          #   - 27017:27017
+          options: 
+            --name mongo
+
+      env:
+        MONGO_URI: 'mongodb://mongo:27017/superData'
+        MONGO_USERNAME: non-prod-user
+        MONGO_PASSWORD: non-prod-password
+
+
+
+      runs-on: ubuntu-latest
+      
+      steps:
+        - name: Checkout Repository
+          uses: actions/checkout@v4
+
+
+        # Not needed as we will be running the job in a nodejs container  
+        # - name: Setup Node.js Version - 18
+        #   uses: actions/setup-node@v3
+        #   with:
+        #     node-version: 18
+
+        - name: Cache NPM dependencies
+          uses: actions/cache@v4
           with:
-            name: Mocha-Test-Result
-            path: test-results.xml
+            path: node_modules
+            key: ${{ runner.os }}-node-modules-${{ hashFiles('package-lock.json') }}
+
+        - name: Install Dependencies
+          run: npm install
+
+        - name: Check Code Coverage
+          continue-on-error: true  # can be used to continue with the other jobs / steps (depending on which level) even when it fails 
+          run: npm run coverage
+
+        - name: Archive Test Result
+          uses: actions/upload-artifact@v4
+          with:
+            name: Code-Coverage-Result
+            path: coverage
+            retention-days: 5
+
+
+    docker:
+      name: Containerization
+      needs: [code-coverage, unit-testing]
+      # giving write access to the github token.Although i think default permission should be read but i was able to create the package without this 
+      permissions:
+        packages: write
+
+      runs-on: ubuntu-latest
+      steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      - name: Dockerhub Login
+        uses: docker/login-action@v2.2.0
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_PASSWORD }}
+
+      - name: GHCR Login
+        uses: docker/login-action@v2.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }} # This GITHUB TOKEN is automatically created and part of secrets during workflow jobs. By default has READ permissions
+
+      - name: Docker Build For Testing
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: false
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+
+      - name: Docker Image Testing
+        run: |
+          docker images
+          docker run --name solar-system-app -d \
+            -p 3000:3000 \
+            -e MONGO_URI=$MONGO_URI \
+            -e MONGO_USERNAME=$MONGO_USERNAME \
+            -e MONGO_PASSWORD=$MONGO_PASSWORD \
+            ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+
+          export IP=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' solar-system-app)
+          echo $IP
+
+          echo Testing Image URL using wget
+          wget -q -O - 127.0.0.1:3000/live | grep live
+
+      - name: Container Registry Push
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          push: true
+          tags: | 
+            ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+            ghcr.io/hongming03/solar-system:${{ github.sha }}
+
+
+    dev-deploy:
+
+      # If condition, will only run if it contains feature in the branch
+      if: contains(github.ref, 'feature/')
+      needs: docker
+
+      # Do not confuse this with env. env is the variable that can be used in job/steps. environment are the variables you set in github
+      # NOTE: environment variables override repository variables that are set in github
+      environment:
+        name: development
+        url: https://${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL}}
+      # Mapping output so that other jobs can use thie variable
+      outputs:
+        APP_INGRESS_URL: ${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL}}
+
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout Repo
+          uses: actions/checkout@v4
+        
+        - name: Install kubectl CLI
+          uses: azure/setup-kubectl@v3
+          with:
+            version: 'v1.26.0'
+
+        # - name: Set Kubeconfig file
+        #   uses: azure/k8s-set-context@v3
+        #   with:
+        #     method: kubeconfig
+        #     kubeconfig: ${{ secrets.KUBECONFIG }  }  WE DONT HAVE KUBECONFIG so we omit
+        
+        # - name: Fetch Kubernetes Cluster Details
+        #   run: |
+        #     kubectl version --short
+        #     echo "----------------------------------------------------"
+        #     kubectl get nodes
+
+# ---------------------------------------
+
+        - name: Save Nginx Ingress Controller IP as a GITHUB Environment Variable
+
+        # Setting an environment variable     echo"{environment_variable_name}={value}" >> "$GITHUB_ENV" . This way can only be used within the same job
+          run: |
+            echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
+
+        # Replacing the variables in the kubernetes yml files by identifying custom prefixes
+        - name: Replace Token in Manifest files
+          uses: cschleiden/replace-tokens@v1
+          with:
+            tokenPrefix: '_{ '
+            tokenSuffix: ' }_'
+            files: '["kubernetes/development/*.yaml"]'
+          env:
+            NAMESPACE: ${{ vars.NAMESPACE }}
+            REPLICAS: ${{ vars.REPLICAS }}
+            IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+            INGRESS_IP: ${{ env.INGRESS_IP }}
+
+        - name: Check files
+          run: |
+            cat kubernetes/development/*.yaml
+
+        # - name: Create MongoDB Secret
+        #   run: |
+        #     kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+        #     --from-literal=MONGO_URI=${{ env.MONGO_URI }} \
+        #     --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+        #     --from-literal=MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }} \
+        #     --save-config \
+        #     --dry-run=client \
+        #     -o yaml | kubectl apply -f -
+
+        # - name: Deploy to Dev Env
+        #   run: |
+        #     kubectl apply -f kubernetes/development
+
+        - name: Set App Ingress Host URL
+          id: set-ingress-host-address
+          # Map this env variable to outputs (located at the beginning of this job). So that other jobs can use it
+          run: |
+            echo "APP_INGRESS_HOST=$(kubectl -n ${{ vars.NAMESPACE }} get ingress -o jsonpath='{.items[0].spec.tls[0].hosts[0]}')" >> "$GITHUB_ENV"
+
+    dev-integration-testing:
+      # If condition, will only run if it contains feature in the branch
+      if: contains(github.ref, 'feature/')
+
+      name: Dev Integration Testing
+      needs: dev-deploy
+      runs-on: ubuntu-latest
+      steps:
+        - name: Test URL Output using CURL and JQ
+        # # This is how to use the environment variables / outputs that are from other jobs
+        #   env:
+        #     URL: ${{ needs.dev-deploy.outputs.APP_INGRESS_URL  } }
+        #   run: |
+        #     echo $URL
+        #     echo "-------------------------------------"
+        #     curl https://$URL/live -s -k | jq -r .status | grep -i live
+          run: echo "Test URL Output using CURL and JQ Done"
+        
+
+    prod-deploy:
+      # If condition, will only run if it contains feature in the branch
+      if: github.ref == 'refs/heads/main'
+
+      needs: docker
+
+    # Do not confuse this with env. env is the variable that can be used in job/steps. environment are the variables you set in github
+    # NOTE: environment variables override repository variables that are set in github
+      environment:
+        name: production
+        url: https://${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL}}
+      # Mapping output so that other jobs can use thie variable
+      outputs:
+        APP_INGRESS_URL: ${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL}}
+
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout Repo
+          uses: actions/checkout@v4
+        
+        - name: Install kubectl CLI
+          uses: azure/setup-kubectl@v3
+          with:
+            version: 'v1.26.0'
+
+        # - name: Set Kubeconfig file
+        #   uses: azure/k8s-set-context@v3
+        #   with:
+        #     method: kubeconfig
+        #     kubeconfig: ${{ secrets.KUBECONFIG }  }  WE DONT HAVE KUBECONFIG so we omit
+        
+        # - name: Fetch Kubernetes Cluster Details
+        #   run: |
+        #     kubectl version --short
+        #     echo "----------------------------------------------------"
+        #     kubectl get nodes
+
+# ---------------------------------------
+
+        - name: Save Nginx Ingress Controller IP as a GITHUB Environment Variable
+
+        # Setting an environment variable     echo"{environment_variable_name}={value}" >> "$GITHUB_ENV" . This way can only be used within the same job
+          run: |
+            echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
+
+        # Replacing the variables in the kubernetes yml files by identifying custom prefixes
+        - name: Replace Token in Manifest files
+          uses: cschleiden/replace-tokens@v1
+          with:
+            tokenPrefix: '_{ '
+            tokenSuffix: ' }_'
+            files: '["kubernetes/production/*.yaml"]'
+          env:
+            NAMESPACE: ${{ vars.NAMESPACE }}
+            REPLICAS: ${{ vars.REPLICAS }}
+            IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+            INGRESS_IP: ${{ env.INGRESS_IP }}
+
+        - name: Check files
+          run: |
+            cat kubernetes/production/*.yaml
+
+        # - name: Create MongoDB Secret
+        #   run: |
+        #     kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+        #     --from-literal=MONGO_URI=${{ env.MONGO_URI }} \
+        #     --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+        #     --from-literal=MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD }} \
+        #     --save-config \
+        #     --dry-run=client \
+        #     -o yaml | kubectl apply -f -
+
+        # - name: Deploy to PROD Env
+        #   run: |
+        #     kubectl apply -f kubernetes/production
+
+        - name: Set App Ingress Host URL
+          id: set-ingress-host-address
+          # Map this env variable to outputs (located at the beginning of this job). So that other jobs can use it
+          run: |
+            echo "APP_INGRESS_HOST=$(kubectl -n ${{ vars.NAMESPACE }} get ingress -o jsonpath='{.items[0].spec.tls[0].hosts[0]}')" >> "$GITHUB_ENV"
+
+
+    prod-integration-testing:
+      # If condition, will only run if it contains feature in the branch
+      if: github.ref == 'refs/heads/main'
+
+      name: PROD Integration Testing
+      needs: prod-deploy
+      runs-on: ubuntu-latest
+      steps:
+        - name: Test URL Output using CURL and JQ
+        # # This is how to use the environment variables / outputs that are from other jobs
+        #   env:
+        #     URL: ${{ needs.prod-deploy.outputs.APP_INGRESS_URL  } }
+        #   run: |
+        #     echo $URL
+        #     echo "-------------------------------------"
+        #     curl https://$URL/live -s -k | jq -r .status | grep -i live
+          run: echo "Test URL Output using CURL and JQ Done"
