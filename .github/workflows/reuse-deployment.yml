@@ -1,0 +1,196 @@
+name: Deployment - Reuseable Workflow
+
+on:
+    workflow_call:
+        # inputs are variables that are passed in by the caller workflow
+        inputs:
+            mongodb-uri:
+                required: true
+                type: string
+
+            kubectl-version:
+                description: Provide the required Kubectl version
+                default: v1.26.0
+                required: false
+                type: string
+
+            k8s-manifest-dir:
+                description: Directory containing Kubernetes manifests files
+                default: kubernetes/
+                required: true
+                type: string
+
+            environment:
+                description: Provide the Deployment Environment
+                default: dev
+                required: true
+                type: string
+
+        # Variables that have to be passed by caller workflow
+        secrets:
+            k8s-kubeconfig:
+                required: true
+            mongodb-password:
+                required: true
+        
+        # Variables that are passed/returned to the caller workflow
+        outputs:
+            application-url:
+                value: ${{ jobs.reuse-deploy.outputs.APP_INGRESS_URL }}
+        
+
+
+jobs:
+    reuse-deploy:
+        # Do not confuse this with env. env is the variable that can be used in job/steps. environment are the variables you set in github
+      # NOTE: environment variables override repository variables that are set in github
+      environment:
+        name: ${{ inputs.environment }}
+        url: https://${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL}}
+      # Mapping output so that other jobs can use this variable
+      outputs:
+        APP_INGRESS_URL: ${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL }}
+
+      runs-on: ubuntu-latest
+      steps:
+        - name: Checkout Repo
+          uses: actions/checkout@v4
+        
+        - name: Install kubectl CLI
+          uses: azure/setup-kubectl@v3
+          with:
+            version: '${{ inputs.kubectl-version }}'
+
+        # - name: Set Kubeconfig file
+        #   uses: azure/k8s-set-context@v3
+        #   with:
+        #     method: kubeconfig
+        #     kubeconfig: ${{ secrets.k8s-kubeconfig }  }  WE DONT HAVE KUBECONFIG so we omit
+        
+        # - name: Fetch Kubernetes Cluster Details
+        #   run: |
+        #     kubectl version --short
+        #     echo "----------------------------------------------------"
+        #     kubectl get nodes
+
+# ---------------------------------------
+
+        - name: Save Nginx Ingress Controller IP as a GITHUB Environment Variable
+
+        # Setting an environment variable     echo"{environment_variable_name}={value}" >> "$GITHUB_ENV" . This way can only be used within the same job
+          run: |
+            echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
+
+        # Replacing the variables in the kubernetes yml files by identifying custom prefixes
+        - name: Replace Token in Manifest files
+          uses: cschleiden/replace-tokens@v1
+          with:
+            tokenPrefix: '_{ '
+            tokenSuffix: ' }_'
+            files: '["${{ inputs.k8s-manifest-dir }}/*.yaml"]'
+          env:
+            NAMESPACE: ${{ vars.NAMESPACE }}
+            REPLICAS: ${{ vars.REPLICAS }}
+            IMAGE: ${{ vars.DOCKERHUB_USERNAME }}/solar-system:${{ github.sha }}
+            INGRESS_IP: ${{ env.INGRESS_IP }}
+
+        - name: Check files
+          run: |
+            cat ${{ inputs.k8s-manifest-dir }}/*.yaml
+
+        # - name: Create MongoDB Secret
+        #   run: |
+        #     kubectl -n ${{ vars.NAMESPACE }} create secret generic mongo-db-creds \
+        #     --from-literal=MONGO_URI=${{ inputs.mongodb-uri }} \
+        #     --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME }} \
+        #     --from-literal=MONGO_PASSWORD=${{ secrets.mongodb-password }} \
+        #     --save-config \
+        #     --dry-run=client \
+        #     -o yaml | kubectl apply -f -
+
+        # - name: Deploy to Dev Env
+        #   run: |
+        #     kubectl apply -f ${{ inputs.k8s-manifest-dir }}
+
+        - name: Set App Ingress Host URL
+          id: set-ingress-host-address
+          # Map this env variable to outputs (located at the beginning of this job). So that other jobs can use it
+          run: |
+            echo "APP_INGRESS_HOST=$(kubectl -n ${{ vars.NAMESPACE }} get ingress -o jsonpath='{.items[0].spec.tls[0].hosts[0]}')" >> "$GITHUB_ENV"
+
+# -------------------PROD
+# # Do not confuse this with env. env is the variable that can be used in job/steps. environment are the variables you set in github
+#     # NOTE: environment variables override repository variables that are set in github
+#       environment:
+#         name: production
+#         url: https://${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL } }
+#       # Mapping output so that other jobs can use thie variable
+#       outputs:
+#         APP_INGRESS_URL: ${{ steps.set-ingress-host-address.outputs.APP_INGRESS_URL } }
+
+#       runs-on: ubuntu-latest
+#       steps:
+#         - name: Checkout Repo
+#           uses: actions/checkout@v4
+        
+#         - name: Install kubectl CLI
+#           uses: azure/setup-kubectl@v3
+#           with:
+#             version: 'v1.26.0'
+
+#         # - name: Set Kubeconfig file
+#         #   uses: azure/k8s-set-context@v3
+#         #   with:
+#         #     method: kubeconfig
+#         #     kubeconfig: ${{ secrets.KUBECONFIG }  }  WE DONT HAVE KUBECONFIG so we omit
+        
+#         # - name: Fetch Kubernetes Cluster Details
+#         #   run: |
+#         #     kubectl version --short
+#         #     echo "----------------------------------------------------"
+#         #     kubectl get nodes
+
+# # ---------------------------------------
+
+#         - name: Save Nginx Ingress Controller IP as a GITHUB Environment Variable
+
+#         # Setting an environment variable     echo"{environment_variable_name}={value}" >> "$GITHUB_ENV" . This way can only be used within the same job
+#           run: |
+#             echo "INGRESS_IP=$(kubectl -n ingress-nginx get services ingress-nginx-controller -o jsonpath="{.status.loadBalancer.ingress[0].ip}")" >> $GITHUB_ENV
+
+#         # Replacing the variables in the kubernetes yml files by identifying custom prefixes
+#         - name: Replace Token in Manifest files
+#           uses: cschleiden/replace-tokens@v1
+#           with:
+#             tokenPrefix: '_{ '
+#             tokenSuffix: ' }_'
+#             files: '["kubernetes/production/*.yaml"]'
+#           env:
+#             NAMESPACE: ${{ vars.NAMESPACE } }
+#             REPLICAS: ${{ vars.REPLICAS } }
+#             IMAGE: ${{ vars.DOCKERHUB_USERNAME } }/solar-system:${{ github.sha } }
+#             INGRESS_IP: ${{ env.INGRESS_IP } }
+
+#         - name: Check files
+#           run: |
+#             cat kubernetes/production/*.yaml
+
+#         # - name: Create MongoDB Secret
+#         #   run: |
+#         #     kubectl -n ${{ vars.NAMESPACE } } create secret generic mongo-db-creds \
+#         #     --from-literal=MONGO_URI=${{ env.MONGO_URI } } \
+#         #     --from-literal=MONGO_USERNAME=${{ vars.MONGO_USERNAME } } \
+#         #     --from-literal=MONGO_PASSWORD=${{ secrets.MONGO_PASSWORD } } \
+#         #     --save-config \
+#         #     --dry-run=client \
+#         #     -o yaml | kubectl apply -f -
+
+#         # - name: Deploy to PROD Env
+#         #   run: |
+#         #     kubectl apply -f kubernetes/production
+
+#         - name: Set App Ingress Host URL
+#           id: set-ingress-host-address
+#           # Map this env variable to outputs (located at the beginning of this job). So that other jobs can use it
+#           run: |
+#             echo "APP_INGRESS_HOST=$(kubectl -n ${{ vars.NAMESPACE } } get ingress -o jsonpath='{.items[0].spec.tls[0].hosts[0]}')" >> "$GITHUB_ENV"
