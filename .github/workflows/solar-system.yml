@@ -6,7 +6,12 @@ on:
     branches:
       - main
       - 'feature/*'
-    
+
+  env:
+  MONGODB_URI: ${{ secrets.MONGODB_URI }}
+  MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
+  MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
+
 jobs:
     unit-testing:
         name: Unit Testing
