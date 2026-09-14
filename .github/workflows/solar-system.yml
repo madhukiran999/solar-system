@@ -18,7 +18,7 @@ jobs:
         runs-on: ubuntu-latest
         steps:
         - name: Checkout Repository
-          uses: actions/checkout@v6
+          uses: actions/checkout@v3
 
         - name: Setup NodeJS Version
           uses: actions/setup-node@v3
@@ -32,7 +32,7 @@ jobs:
           run: npm test
           
         - name: Archive Test Result
-          uses: actions/upload-artifact@v3
+          uses: actions/upload-artifact@v6
           with:
             name: Mocha-Test-Result
             path: test-results.xml
