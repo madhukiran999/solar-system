@@ -7,7 +7,7 @@ on:
       - main
       - 'feature/*'
 
-  env:
+env:
   MONGODB_URI: ${{ secrets.MONGODB_URI }}
   MONGODB_USERNAME: ${{ secrets.MONGODB_USERNAME }}
   MONGODB_PASSWORD: ${{ secrets.MONGODB_PASSWORD }}
