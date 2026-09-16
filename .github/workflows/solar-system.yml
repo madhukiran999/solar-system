@@ -24,16 +24,52 @@ jobs:
           uses: actions/setup-node@v3
           with:
             node-version: 20
+        - name: cache npm step
+          uses: actions/cache@v4
+          with:
+            path: ./node_modules
+            key:  ${{ runner.os }}-npm-${{ hashFiles('package-lock.json') }}
     
         - name: Install Dependencies
           run: npm install
     
         - name: Unit Testing
-          #continue-on-error: true
+          id: test-step
           run: npm test
           
         - name: Archive Test Result
+          if: always()
           uses: actions/upload-artifact@v6
           with:
             name: Mocha-Test-Result
             path: test-results.xml
+
+    code-coverage:
+      name: Code Coverage
+      runs-on: ubuntu-latest
+      steps:
+
+        - name: Checkout Repository
+          uses: actions/checkout@v4
+
+        - name: Setup NodeJS Version - 18
+          uses: actions/setup-node@v6
+          with:
+            node-version: 20
+
+        - name: Install Dependencies
+          run: npm install
+
+        - name: Check Code Coverage
+          continue-on-error: true
+          run: npm run coverage
+
+        - name: Archive Test Result
+          uses: actions/upload-artifact@v3
+          with:
+            name: Code-Coverage-Result
+            path: coverage
+            retention-days: 5
+
+       
+            
